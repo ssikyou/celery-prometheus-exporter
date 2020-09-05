@@ -62,6 +62,8 @@ QUEUE_LENGTH = prometheus_client.Gauge(
     'celery_queue_length', 'Number of tasks in the queue.',
     ['queue_name']
 )
+TASKS_ACTIVE = prometheus_client.Gauge(
+    'celery_tasks_active', 'Number of active tasks')
 
 
 class MonitorThread(threading.Thread):
@@ -100,9 +102,10 @@ class MonitorThread(threading.Thread):
                     task = celery.events.state.Task()
                     task.event(evt_state)
                     state = task.state
-                if state == celery.states.STARTED:
-                    self._observe_latency(evt)
-                self._collect_tasks(evt, state)
+                # if state == celery.states.STARTED:
+                #     self._observe_latency(evt)
+                # self._collect_tasks(evt, state)
+                TASKS.labels(state=state).inc()
 
     def _observe_latency(self, evt):
         try:
@@ -160,18 +163,18 @@ class MonitorThread(threading.Thread):
                     recv = self._app.events.Receiver(conn, handlers={
                         '*': self._process_event,
                     })
-                    setup_metrics(self._app)
+                    # setup_metrics(self._app)
                     recv.capture(limit=None, timeout=None, wakeup=True)
                     self.log.info("Connected to broker")
             except Exception:
                 self.log.exception("Queue connection failed")
-                setup_metrics(self._app)
+                # setup_metrics(self._app)
                 time.sleep(5)
 
 
 class WorkerMonitoringThread(threading.Thread):
     celery_ping_timeout_seconds = 5
-    periodicity_seconds = 5
+    periodicity_seconds = 15
 
     def __init__(self, app=None, *args, **kwargs):
         self._app = app
@@ -191,8 +194,32 @@ class WorkerMonitoringThread(threading.Thread):
             self.log.exception("Error while pinging workers")
 
 
+class ActiveTaskMonitoringThread(threading.Thread):
+    periodicity_seconds = 15
+
+    def __init__(self, app=None, *args, **kwargs):
+        self._app = app
+        self.log = logging.getLogger('active-task-monitor')
+        super(ActiveTaskMonitoringThread, self).__init__(*args, **kwargs)
+
+    def run(self):  # pragma: no cover
+        while True:
+            self.update_active_count()
+            time.sleep(self.periodicity_seconds)
+
+    def update_active_count(self):
+        try:
+            n = 0
+            active_workers_dict = self._app.control.inspect().active()
+            for worker_name, active_tasks in active_workers_dict.items():
+                n += len(active_tasks)
+            TASKS_ACTIVE.set(n)
+        except Exception:  # pragma: no cover
+            self.log.exception("Error while inspect active tasks")
+
+
 class EnableEventsThread(threading.Thread):
-    periodicity_seconds = 5
+    periodicity_seconds = 15
 
     def __init__(self, app=None, *args, **kwargs):  # pragma: no cover
         self._app = app
@@ -212,7 +239,7 @@ class EnableEventsThread(threading.Thread):
 
 
 class QueueLengthMonitoringThread(threading.Thread):
-    periodicity_seconds = 30
+    periodicity_seconds = 15
 
     def __init__(self, app, queue_list):
         # type: (celery.Celery, [str]) -> None
@@ -249,6 +276,7 @@ def setup_metrics(app):
     even before the first event is received, data can be exposed.
     """
     WORKERS.set(0)
+    TASKS_ACTIVE.set(0)
     logging.info('Setting up metrics, trying to connect to broker...')
     try:
         registered_tasks = app.control.inspect().registered_tasks().values()
@@ -336,7 +364,7 @@ def main():  # pragma: no cover
         os.environ['TZ'] = opts.tz
         time.tzset()
 
-    logging.info('Setting up celery for {}'.format(opts.broker))
+    # logging.info('Setting up celery for {}'.format(opts.broker))
     app = celery.Celery(broker=opts.broker)
 
     if opts.transport_options:
@@ -359,6 +387,10 @@ def main():  # pragma: no cover
     w.daemon = True
     w.start()
 
+    a = ActiveTaskMonitoringThread(app=app)
+    a.daemon = True
+    a.start()
+
     if opts.queue_list:
         if type(opts.queue_list) == str:
             queue_list = opts.queue_list.split(',')
@@ -378,6 +410,7 @@ def main():  # pragma: no cover
     start_httpd(opts.addr)
     t.join()
     w.join()
+    a.join()
     if e is not None:
         e.join()
 
