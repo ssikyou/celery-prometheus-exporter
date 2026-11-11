@@ -42,6 +42,11 @@ DEFAULT_MAX_TASKS_IN_MEMORY = int(os.environ.get('DEFAULT_MAX_TASKS_IN_MEMORY',
                                                  '10000'))
 RUNTIME_HISTOGRAM_BUCKETS = get_histogram_buckets_from_evn('RUNTIME_HISTOGRAM_BUCKETS')
 LATENCY_HISTOGRAM_BUCKETS = get_histogram_buckets_from_evn('LATENCY_HISTOGRAM_BUCKETS')
+# Per worker task runtime buckets, default suits download tasks taking seconds to minutes
+WORKER_RUNTIME_HISTOGRAM_BUCKETS = (
+    decode_buckets(os.environ['WORKER_RUNTIME_HISTOGRAM_BUCKETS'])
+    if 'WORKER_RUNTIME_HISTOGRAM_BUCKETS' in os.environ
+    else (0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600, 1800, float('inf')))
 DEFAULT_QUEUE_LIST = os.environ.get('QUEUE_LIST', [])
 
 LOG_FORMAT = '[%(asctime)s] %(name)s:%(levelname)s: %(message)s'
@@ -64,6 +69,32 @@ QUEUE_LENGTH = prometheus_client.Gauge(
 )
 TASKS_ACTIVE = prometheus_client.Gauge(
     'celery_tasks_active', 'Number of active tasks')
+
+# Per worker metrics, labelled by worker hostname (e.g. celery1@host)
+WORKER_UP = prometheus_client.Gauge(
+    'celery_worker_up',
+    'Whether the worker replied to the last ping (1) or not (0)',
+    ['hostname'])
+WORKER_TASKS = prometheus_client.Counter(
+    'celery_worker_tasks',
+    'Number of task events per worker and state',
+    ['hostname', 'state'])
+WORKER_TASK_RUNTIME = prometheus_client.Histogram(
+    'celery_worker_task_runtime_seconds',
+    'Runtime of succeeded tasks per worker (seconds)',
+    ['hostname'], buckets=WORKER_RUNTIME_HISTOGRAM_BUCKETS)
+WORKER_TASKS_ACTIVE = prometheus_client.Gauge(
+    'celery_worker_tasks_active',
+    'Number of tasks currently executing per worker',
+    ['hostname'])
+WORKER_TASKS_RESERVED = prometheus_client.Gauge(
+    'celery_worker_tasks_reserved',
+    'Number of tasks prefetched but not yet executing per worker',
+    ['hostname'])
+WORKER_CONCURRENCY = prometheus_client.Gauge(
+    'celery_worker_concurrency',
+    'Max concurrency of the worker pool',
+    ['hostname'])
 
 
 class MonitorThread(threading.Thread):
@@ -106,6 +137,15 @@ class MonitorThread(threading.Thread):
                 #     self._observe_latency(evt)
                 # self._collect_tasks(evt, state)
                 TASKS.labels(state=state).inc()
+                self._collect_worker_task(evt, state)
+
+    def _collect_worker_task(self, evt, state):
+        hostname = evt.get('hostname')
+        if not hostname:
+            return
+        WORKER_TASKS.labels(hostname=hostname, state=state).inc()
+        if state == celery.states.SUCCESS and evt.get('runtime') is not None:
+            WORKER_TASK_RUNTIME.labels(hostname=hostname).observe(evt['runtime'])
 
     def _observe_latency(self, evt):
         try:
@@ -179,6 +219,7 @@ class WorkerMonitoringThread(threading.Thread):
     def __init__(self, app=None, *args, **kwargs):
         self._app = app
         self.log = logging.getLogger('workers-monitor')
+        self._known_workers = set()
         super(WorkerMonitoringThread, self).__init__(*args, **kwargs)
 
     def run(self):  # pragma: no cover
@@ -188,18 +229,32 @@ class WorkerMonitoringThread(threading.Thread):
 
     def update_workers_count(self):
         try:
-            WORKERS.set(len(self._app.control.ping(
-                timeout=self.celery_ping_timeout_seconds)))
+            replies = self._app.control.ping(
+                timeout=self.celery_ping_timeout_seconds)
         except Exception:  # pragma: no cover
             self.log.exception("Error while pinging workers")
+            return
+        WORKERS.set(len(replies))
+        # each reply looks like {'celery@host': {'ok': 'pong'}}
+        alive = set()
+        for reply in replies:
+            if isinstance(reply, dict):
+                alive.update(reply.keys())
+        # keep workers seen before but not replying now as down(0)
+        self._known_workers.update(alive)
+        for hostname in self._known_workers:
+            WORKER_UP.labels(hostname=hostname).set(
+                1 if hostname in alive else 0)
 
 
 class ActiveTaskMonitoringThread(threading.Thread):
     periodicity_seconds = 15
+    inspect_timeout_seconds = 3
 
     def __init__(self, app=None, *args, **kwargs):
         self._app = app
         self.log = logging.getLogger('active-task-monitor')
+        self._reported_workers = set()
         super(ActiveTaskMonitoringThread, self).__init__(*args, **kwargs)
 
     def run(self):  # pragma: no cover
@@ -209,13 +264,42 @@ class ActiveTaskMonitoringThread(threading.Thread):
 
     def update_active_count(self):
         try:
-            n = 0
-            active_workers_dict = self._app.control.inspect().active()
-            for worker_name, active_tasks in active_workers_dict.items():
-                n += len(active_tasks)
-            TASKS_ACTIVE.set(n)
+            inspect = self._app.control.inspect(
+                timeout=self.inspect_timeout_seconds)
+            active = inspect.active()
+            reserved = inspect.reserved() or {}
+            stats = inspect.stats() or {}
         except Exception:  # pragma: no cover
             self.log.exception("Error while inspect active tasks")
+            return
+        if not active:
+            self.log.warning("No worker replied to inspect active tasks")
+            active = {}
+        else:
+            TASKS_ACTIVE.set(sum(len(tasks) for tasks in active.values()))
+
+        replied = set(active) | set(reserved) | set(stats)
+        for hostname in replied:
+            if hostname in active:
+                WORKER_TASKS_ACTIVE.labels(hostname=hostname).set(
+                    len(active[hostname]))
+            if hostname in reserved:
+                WORKER_TASKS_RESERVED.labels(hostname=hostname).set(
+                    len(reserved[hostname]))
+            concurrency = (stats.get(hostname) or {}).get(
+                'pool', {}).get('max-concurrency')
+            if concurrency is not None:
+                WORKER_CONCURRENCY.labels(hostname=hostname).set(concurrency)
+        # drop series of workers that stopped replying, so graphs show a gap
+        # instead of a stale value
+        for hostname in self._reported_workers - replied:
+            for metric in (WORKER_TASKS_ACTIVE, WORKER_TASKS_RESERVED,
+                           WORKER_CONCURRENCY):
+                try:
+                    metric.remove(hostname)
+                except KeyError:
+                    pass
+        self._reported_workers = replied
 
 
 class EnableEventsThread(threading.Thread):
