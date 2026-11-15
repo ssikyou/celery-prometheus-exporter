@@ -13,6 +13,7 @@ import threading
 import time
 import json
 import os
+import re
 from celery.utils.objects import FallbackContext
 import amqp.exceptions
 
@@ -95,6 +96,57 @@ WORKER_CONCURRENCY = prometheus_client.Gauge(
     'celery_worker_concurrency',
     'Max concurrency of the worker pool',
     ['hostname'])
+TASK_ERRORS = prometheus_client.Counter(
+    'celery_task_errors',
+    'Failed and retried tasks per worker by normalized exception',
+    ['hostname', 'state', 'error'])
+
+# distinct "error" label values kept before new ones are counted as "<Name>: other"
+TASK_ERRORS_MAX_LABELS = int(os.environ.get('TASK_ERRORS_MAX_LABELS', 100))
+_error_labels = set()
+_ERROR_EVENT_STATES = {'task-failed': 'FAILURE', 'task-retried': 'RETRY'}
+_EXC_REPR_RE = re.compile(r'^\s*([\w.]+)\((.*)\)\s*$', re.S)
+_HTTP_ERROR_RE = re.compile(
+    r'(\d{3}) (?:Client|Server) Error: .*? for url: (https?://[^/\s\'",)]+)')
+_HTTP_FROM_RE = re.compile(r'\bHTTP (\d{3}) from ([^\s\'",)]+)')
+_URL_RE = re.compile(r'https?://([^/\s\'",)]+)[^\s\'",)]*')
+_IP_RE = re.compile(r'\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b')
+
+
+def _domain(host):
+    """v16m.tiktokcdn-us.com:443 -> tiktokcdn-us.com, an ip -> IP"""
+    host = host.split('//')[-1].split('@')[-1].split('/')[0]
+    host = host.split(':')[0].lower()
+    if re.match(r'^\d{1,3}(\.\d{1,3}){3}$', host):
+        return 'IP'
+    return '.'.join(host.split('.')[-2:])
+
+
+def normalize_exception(text, max_len=100):
+    """Turn a task event's exception repr into a low cardinality label.
+
+    DownloadError('HTTP 403 from v16m.tiktokcdn-us.com') and the older
+    DownloadError('HTTPError: 403 Client Error: Forbidden for url:
+    https://v16m.tiktokcdn-us.com/...') both become
+    "DownloadError: HTTP 403 from tiktokcdn-us.com".
+    """
+    if not text:
+        return 'unknown'
+    m = _EXC_REPR_RE.match(text)
+    name, msg = (m.group(1), m.group(2)) if m else ('Exception', text)
+    msg = msg.strip()
+    if len(msg) >= 2 and msg[0] == msg[-1] and msg[0] in '\'"':
+        msg = msg[1:-1]
+    http = _HTTP_ERROR_RE.search(msg)
+    if http:
+        msg = 'HTTP {} from {}'.format(http.group(1), _domain(http.group(2)))
+    else:
+        msg = _HTTP_FROM_RE.sub(lambda h: 'HTTP {} from {}'.format(
+            h.group(1), _domain(h.group(2))), msg)
+        msg = _URL_RE.sub(lambda u: _domain(u.group(1)), msg)
+        msg = _IP_RE.sub('IP', msg)
+        msg = re.sub(r'\d{4,}', 'N', msg)
+    return '{}: {}'.format(name.split('.')[-1], msg)[:max_len]
 
 
 class MonitorThread(threading.Thread):
@@ -146,6 +198,18 @@ class MonitorThread(threading.Thread):
         WORKER_TASKS.labels(hostname=hostname, state=state).inc()
         if state == celery.states.SUCCESS and evt.get('runtime') is not None:
             WORKER_TASK_RUNTIME.labels(hostname=hostname).observe(evt['runtime'])
+        if evt['type'] in _ERROR_EVENT_STATES:
+            self._collect_task_error(evt, hostname)
+
+    def _collect_task_error(self, evt, hostname):
+        error = normalize_exception(evt.get('exception'))
+        if error not in _error_labels:
+            if len(_error_labels) >= TASK_ERRORS_MAX_LABELS:
+                error = error.split(':')[0] + ': other'
+            _error_labels.add(error)
+        TASK_ERRORS.labels(hostname=hostname,
+                           state=_ERROR_EVENT_STATES[evt['type']],
+                           error=error).inc()
 
     def _observe_latency(self, evt):
         try:

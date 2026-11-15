@@ -133,3 +133,58 @@ class TestWorkerActive(TestCase):
         # total keeps the last value like before, per worker series dropped
         assert sample('celery_tasks_active') == 2
         assert sample('celery_worker_tasks_active', hostname='w-n1@h') is None
+
+
+class TestTaskErrors(TestCase):
+    def test_normalize_exception(self):
+        from celery_prometheus_exporter import normalize_exception as n
+        old = ("DownloadError('HTTPError: 403 Client Error: Forbidden for url: "
+               "https://v16m.tiktokcdn-us.com/abc/6af84afc/video/tos/a=1233&x=1')")
+        assert n(old) == 'DownloadError: HTTP 403 from tiktokcdn-us.com'
+        assert n("DownloadError('HTTP 404 from api16-normal-c-alisg.tiktokv.com')") \
+            == 'DownloadError: HTTP 404 from tiktokv.com'
+        assert n("DownloadError('HTTP 403 from fastdl.muscdn.app')") \
+            == 'DownloadError: HTTP 403 from muscdn.app'
+        assert n("FileNotFoundError(2, 'No such file or directory')") \
+            == "FileNotFoundError: 2, 'No such file or directory'"
+        assert n("ConnectionError('Error 110 connecting to 45.79.249.219:6379. "
+                 "Connection timed out.')") \
+            == 'ConnectionError: Error 110 connecting to IP. Connection timed out.'
+        assert n("DownloadError('incomplete download: 1048576/2345678 bytes')") \
+            == 'DownloadError: incomplete download: N/N bytes'
+        assert n("TimeLimitExceeded(1530,)") == 'TimeLimitExceeded: N,'
+        assert n(None) == 'unknown'
+        assert len(n("ValueError('" + 'x' * 500 + "')")) == 100
+
+    def test_counts_failed_and_retried_by_error(self):
+        m = MonitorThread(app=get_app())
+        host = 'w-err@host'
+        exc = "DownloadError('HTTP 403 from v19.tiktokcdn-us.com')"
+        err = 'DownloadError: HTTP 403 from tiktokcdn-us.com'
+        m._process_event(Event('task-retried', uuid=uuid(), hostname=host,
+                               exception=exc, clock=0, local_received=1))
+        m._process_event(Event('task-retried', uuid=uuid(), hostname=host,
+                               exception=exc.replace('v19', 'v16m'),
+                               clock=1, local_received=2))
+        m._process_event(Event('task-failed', uuid=uuid(), hostname=host,
+                               exception=exc, clock=2, local_received=3))
+        m._process_event(Event('task-succeeded', uuid=uuid(), hostname=host,
+                               runtime=1, clock=3, local_received=4))
+        assert sample('celery_task_errors_total', hostname=host,
+                      state='RETRY', error=err) == 2
+        assert sample('celery_task_errors_total', hostname=host,
+                      state='FAILURE', error=err) == 1
+
+    def test_error_labels_are_capped(self):
+        import celery_prometheus_exporter as cpe
+        m = MonitorThread(app=get_app())
+        host = 'w-cap@host'
+        with patch.object(cpe, 'TASK_ERRORS_MAX_LABELS', 0), \
+                patch.object(cpe, '_error_labels', set()):
+            m._process_event(Event('task-failed', uuid=uuid(), hostname=host,
+                                   exception="KeyError('abc')",
+                                   clock=0, local_received=1))
+        assert sample('celery_task_errors_total', hostname=host,
+                      state='FAILURE', error='KeyError: other') == 1
+        assert sample('celery_task_errors_total', hostname=host,
+                      state='FAILURE', error="KeyError: abc") is None
